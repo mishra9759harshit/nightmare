@@ -6,7 +6,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
----------- CONFIG / DEFAULTS ----------
+#---------- CONFIG / DEFAULTS ----------
 ENV_FILES=(./.env "$HOME/.termux_status.env")
 REFRESH_INTERVAL=30 # default refresh interval in seconds
 LOG_DIR="$HOME/status_logs"
@@ -14,7 +14,7 @@ PROJECTS=() # space-separated URLs in .env PROJECTS
 OSINT_SCRIPT="$HOME/nightmare_pro.sh"
 WIFI_TOOL_PY="$HOME/wifitool.py"
 
----------- COLORS ----------
+#---------- COLORS ----------
 ESC="$(printf '\033')"
 RESET="${ESC}[0m"
 BOLD="${ESC}[1m"
@@ -26,7 +26,7 @@ MAGENTA="${ESC}[35m"
 CYAN="${ESC}[36m"
 WHITE="${ESC}[37m"
 
----------- UTILS ----------
+#---------- UTILS ----------
 info() { printf "%b\n" "${CYAN}[i]${RESET} $*\n"; }
 warn() { printf "%b\n" "${YELLOW}[!]${RESET} $*\n"; }
 err() { printf "%b\n" "${RED}[x]${RESET} $*\n"; }
@@ -94,7 +94,7 @@ http_get() {
   fi
 }
 
----------- API FETCHERS ----------
+#---------- API FETCHERS ----------
 
 # GitHub: list repos + last commit + actions (best-effort)
 github_fetch() {
@@ -174,7 +174,7 @@ render_fetch() {
   echo "$r" | jq -r '.[] | "\(.name) • state:\(.state) • url: \(.serviceDetails?.webURL // .url // "n/a")"'
 }
 
----------- DEVICE STATUS ----------
+#---------- DEVICE STATUS ----------
 
 device_summary() {
   # IP(s)
@@ -201,7 +201,7 @@ device_summary() {
   printf "IP(s): %s\nBattery: %s\nUptime: %s\nLoad: %s\nMemory: %s\n" "$ips" "$bat" "$uptime_text" "$load" "$mem"
 }
 
----------- PORTS / NETWORK ----------
+#---------- PORTS / NETWORK ----------
 
 listening_sockets() {
   if command -v ss >/dev/null 2>&1; then
@@ -229,7 +229,7 @@ nmap_scan_local() {
   nmap -sT -Pn -F "$ip_local"
 }
 
----------- RUN EXTERNAL SCRIPTS ----------
+#---------- RUN EXTERNAL SCRIPTS ----------
 
 run_osint() {
   if [ -x "${OSINT_SCRIPT}" ]; then
@@ -259,7 +259,7 @@ run_wifi() {
   fi
 }
 
----------- TUI DRAWING ----------
+#---------- TUI DRAWING ----------
 
 # Minimal box drawing using tput; updates every REFRESH_INTERVAL seconds
 
@@ -321,7 +321,7 @@ render_lines_into_box() {
   done
 }
 
----------- SNAPSHOT LOGGING ----------
+#---------- SNAPSHOT LOGGING ----------
 
 log_snapshot() {
   local stamp
@@ -344,7 +344,7 @@ log_snapshot() {
   chmod 600 "$outfile" || true
 }
 
----------- MAIN LOOP / KEY HANDLING ----------
+#---------- MAIN LOOP / KEY HANDLING ----------
 
 cleanup() {
   tput cnorm    # show cursor
@@ -514,7 +514,7 @@ main_loop() {
   done
 }
 
----------- STARTUP ----------
+#---------- STARTUP ----------
 
 load_env
 check_deps
