@@ -2,7 +2,7 @@
 #
 # termux_tui_dashboard.sh
 # Live TUI Termux dashboard — token-based (.env) GitHub / Vercel / Render / Device status + quick-run tools
-# Author: Secure Coder (generated)
+# Author: Secure Coder (updated)
 # NOTE: Tokens are read from a .env file and NOT stored inside the script.
 
 set -euo pipefail
@@ -10,7 +10,7 @@ IFS=$'\n\t'
 
 # ---------- CONFIG / DEFAULTS ----------
 ENV_FILES=(./.env "$HOME/.termux_status.env")
-REFRESH_INTERVAL=30          # overridden by .env REFRESH_INTERVAL (seconds)
+REFRESH_INTERVAL=10          # overridden by .env REFRESH_INTERVAL (seconds)
 LOG_DIR="$HOME/status_logs"
 PROJECTS=()                  # space-separated URLs in .env PROJECTS
 OSINT_SCRIPT="$HOME/nightmare_pro.sh"
@@ -34,15 +34,11 @@ warn()    { printf "%b\n" "${YELLOW}[!]${RESET} $*"; }
 err()     { printf "%b\n" "${RED}[x]${RESET} $*"; }
 success() { printf "%b\n" "${GREEN}[✓]${RESET} $*"; }
 
-# Read .env (simple parser, ignores comments & blank lines)
+# Load .env
 load_env() {
   for f in "${ENV_FILES[@]}"; do
     [ -f "$f" ] || continue
-    # shellcheck disable=SC1090
     set -o allexport
-    # read only simple KEY="value"
-    # Use a subshell to avoid polluting current env if file has unexpected code
-    # This is purposely conservative: only export KEY=VALUE lines (no command substitution)
     while IFS= read -r line || [ -n "$line" ]; do
       line_trim="$(printf "%s" "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       case "$line_trim" in
@@ -50,10 +46,7 @@ load_env() {
         *=*)
           key=$(printf "%s" "$line_trim" | sed -E 's/=.*//')
           val=$(printf "%s" "$line_trim" | sed -E 's/^[^=]*=//; s/^"//; s/"$//')
-          # assign only safe-looking keys
-          if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
-            export "$key"="$val"
-          fi
+          [[ "$key" =~ ^[A-Z0-9_]+$ ]] && export "$key"="$val"
           ;;
       esac
     done <"$f"
@@ -62,24 +55,18 @@ load_env() {
     break
   done
 
-  # apply fallbacks / map env vars
-  : "${REFRESH_INTERVAL:=${REFRESH_INTERVAL}}"
+  : "${REFRESH_INTERVAL:=$REFRESH_INTERVAL}"
   if [ -n "${PROJECTS:-}" ]; then
-    # PROJECTS may be a space-separated string in env
     read -r -a PROJECTS <<<"$PROJECTS"
   fi
-  : "${OSINT_SCRIPT:=$OSINT_SCRIPT}"
-  : "${WIFI_TOOL_PY:=$WIFI_TOOL_PY}"
 }
 
-# Dependency check (offers install commands)
+# Dependency check
 check_deps(){
-  local need=(curl jq)
+  local need=(curl jq ip ss)
   local missing=()
   for c in "${need[@]}"; do
-    if ! command -v "$c" >/dev/null 2>&1; then
-      missing+=("$c")
-    fi
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if [ ${#missing[@]} -gt 0 ]; then
     warn "Missing tools: ${missing[*]}"
@@ -90,430 +77,176 @@ check_deps(){
 # Create log dir
 mkdir -p "$LOG_DIR"
 
-# Safe HTTP helper (with token header if present)
+# Safe HTTP helper
 http_get(){
   local url="$1"
   local token="$2"
-  if [ -n "$token" ]; then
-    curl -sS -H "Authorization: Bearer $token" -H "User-Agent: Termux-TUI/1.0" "$url"
-  else
-    curl -sS -H "User-Agent: Termux-TUI/1.0" "$url"
-  fi
+  [ -n "$token" ] && curl -sS -H "Authorization: Bearer $token" -H "User-Agent: Termux-TUI/1.0" "$url" || curl -sS -H "User-Agent: Termux-TUI/1.0" "$url"
 }
 
 # ---------- API FETCHERS ----------
-# GitHub: list repos + last commit + actions (best-effort)
 github_fetch(){
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "GITHUB_TOKEN not set"
-    return
-  fi
-  # list up to 50 repos accessible by token (user & org)
-  local repos_json
-  repos_json=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/user/repos?per_page=50&sort=updated")
-  if [ -z "$repos_json" ]; then
-    echo "Failed to query GitHub API"
-    return
-  fi
-  # parse 6 most recently updated repos
-  echo "$repos_json" | jq -r '[.[] | {name:.full_name, private:.private, stars:.stargazers_count, updated:.updated_at, default_branch:.default_branch, url:.html_url}] | sort_by(.updated) | reverse | .[0:6] | .[] | "\(.name) • \(.private|tostring) • ★\(.stars) • updated:\(.updated) • \(.url)"'
+  [ -z "${GITHUB_TOKEN:-}" ] && echo "GITHUB_TOKEN not set" && return
+  curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/user/repos?per_page=50&sort=updated" \
+    | jq -r '[.[] | {name:.full_name, private:.private, stars:.stargazers_count, updated:.updated_at, url:.html_url}] | sort_by(.updated) | reverse | .[0:6][] | "\(.name) • \(.private|tostring) • ★\(.stars) • updated:\(.updated) • \(.url)"'
 }
 
-# GitHub - fetch Actions status for a repo (best-effort)
 github_actions_status(){
   local repo="$1"
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "GITHUB_TOKEN not set"
-    return
-  fi
-  # get last workflow run
-  local api="https://api.github.com/repos/${repo}/actions/runs?per_page=1"
-  local r
-  r=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "$api")
-  if [ -z "$r" ]; then
-    echo "—"
-    return
-  fi
+  [ -z "${GITHUB_TOKEN:-}" ] && echo "GITHUB_TOKEN not set" && return
+  local r=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${repo}/actions/runs?per_page=1")
   echo "$r" | jq -r '.workflow_runs[0] | "\(.name // "workflow") — \(.conclusion // .status) — \(.html_url)"' 2>/dev/null || echo "—"
 }
 
-# Vercel: list projects (v8 endpoint) and last deployment (best-effort)
 vercel_fetch(){
-  if [ -z "${VERCEL_TOKEN:-}" ]; then
-    echo "VERCEL_TOKEN not set"
-    return
-  fi
-  # Try projects endpoint (v8)
-  local projects
-  projects=$(curl -sS -H "Authorization: Bearer ${VERCEL_TOKEN}" "https://api.vercel.com/v8/projects")
-  if [ -z "$projects" ]; then
-    echo "Failed to query Vercel API"
-    return
-  fi
-  # parse up to 6 projects
+  [ -z "${VERCEL_TOKEN:-}" ] && echo "VERCEL_TOKEN not set" && return
+  local projects=$(curl -sS -H "Authorization: Bearer ${VERCEL_TOKEN}" "https://api.vercel.com/v8/projects")
   echo "$projects" | jq -r '.projects[0:6][] | "\(.name) • id:\(.id) • org:\(.team?.name // "personal")"'
 }
 
 vercel_last_deploy(){
   local projectId="$1"
-  if [ -z "${VERCEL_TOKEN:-}" ] || [ -z "$projectId" ]; then
-    echo "—"
-    return
-  fi
-  local url="https://api.vercel.com/v12/now/deployments?projectId=${projectId}&limit=1"
-  local r
-  r=$(curl -sS -H "Authorization: Bearer ${VERCEL_TOKEN}" "$url")
+  [ -z "${VERCEL_TOKEN:-}" ] && echo "—" && return
+  local r=$(curl -sS -H "Authorization: Bearer ${VERCEL_TOKEN}" "https://api.vercel.com/v12/now/deployments?projectId=${projectId}&limit=1")
   echo "$r" | jq -r '.deployments[0] | "\(.state // "unknown") — \(.url // .name // "n/a") — created:\(.createdAt // 0)"' 2>/dev/null || echo "—"
 }
 
-# Render: list services
 render_fetch(){
-  if [ -z "${RENDER_TOKEN:-}" ]; then
-    echo "RENDER_TOKEN not set"
-    return
-  fi
-  local r
-  r=$(curl -sS -H "Authorization: Bearer ${RENDER_TOKEN}" "https://api.render.com/v1/services")
-  if [ -z "$r" ]; then
-    echo "Failed to query Render API"
-    return
-  fi
+  [ -z "${RENDER_TOKEN:-}" ] && echo "RENDER_TOKEN not set" && return
+  local r=$(curl -sS -H "Authorization: Bearer ${RENDER_TOKEN}" "https://api.render.com/v1/services")
   echo "$r" | jq -r '.[] | "\(.name) • state:\(.state) • url:\(.serviceDetails?.webURL // .url // "n/a")"'
 }
 
 # ---------- DEVICE STATUS ----------
 device_summary(){
-  # IP(s)
-  local ips
-  ips=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | tr '\n' ' ' || true)
-  if [ -z "$ips" ]; then
-    ips=$(hostname -I 2>/dev/null || echo "N/A")
-  fi
-  # battery (termux-api)
+  local ips=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | tr '\n' ' ' || true)
+  [ -z "$ips" ] && ips=$(hostname -I 2>/dev/null || echo "N/A")
   local bat="N/A"
-  if command -v termux-battery-status >/dev/null 2>&1; then
-    bat=$(termux-battery-status | jq -r '"\(.percentage)% (\(.health // "unknown"))"')
-  fi
-  local uptime_text
-  uptime_text=$(uptime -p 2>/dev/null || awk '{print int($1/3600)"h"}' /proc/uptime 2>/dev/null || echo "N/A")
-  local load
-  load=$(cat /proc/loadavg 2>/dev/null | awk '{print $1" "$2" "$3}' || echo "N/A")
-  local mem
-  if command -v free >/dev/null 2>&1; then
-    mem=$(free -h | awk 'NR==2{print $3"/"$2}')
-  else
-    mem="N/A"
-  fi
+  command -v termux-battery-status >/dev/null 2>&1 && bat=$(termux-battery-status | jq -r '"\(.percentage)% (\(.health // "unknown"))"')
+  local uptime_text=$(uptime -p 2>/dev/null || echo "N/A")
+  local load=$(awk '{print $1" "$2" "$3}' /proc/loadavg 2>/dev/null || echo "N/A")
+  local mem=$(command -v free >/dev/null 2>&1 && free -h | awk 'NR==2{print $3"/"$2}' || echo "N/A")
   printf "IP(s): %s\nBattery: %s\nUptime: %s\nLoad: %s\nMemory: %s\n" "$ips" "$bat" "$uptime_text" "$load" "$mem"
 }
 
 # ---------- PORTS / NETWORK ----------
 listening_sockets(){
-  if command -v ss >/dev/null 2>&1; then
-    ss -tulpen 2>/dev/null | sed -n '1,200p'
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -tulpen 2>/dev/null | sed -n '1,200p'
-  else
-    echo "ss/netstat not available"
-  fi
+  command -v ss >/dev/null 2>&1 && ss -tulpen 2>/dev/null || command -v netstat >/dev/null 2>&1 && netstat -tulpen 2>/dev/null || echo "ss/netstat not available"
 }
 
-# optional nmap quick scan on local IP
 nmap_scan_local(){
-  if ! command -v nmap >/dev/null 2>&1; then
-    echo "nmap not installed"
-    return
-  fi
-  local ip_local
-  ip_local=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true)
-  if [ -z "$ip_local" ]; then
-    echo "Could not determine local IP"
-    return
-  fi
+  command -v nmap >/dev/null 2>&1 || { echo "nmap not installed"; return; }
+  local ip_local=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true)
+  [ -z "$ip_local" ] && { echo "Could not determine local IP"; return; }
   echo "Running quick nmap -sT -Pn -F on $ip_local"
   nmap -sT -Pn -F "$ip_local"
 }
 
-# ---------- RUN EXTERNAL SCRIPTS ----------
-run_osint(){
-  if [ -x "${OSINT_SCRIPT}" ]; then
-    "${OSINT_SCRIPT}" &
-    return 0
-  else
-    echo "OSINT script not found or not executable: ${OSINT_SCRIPT}"
-    return 1
-  fi
-}
-
+run_osint(){ [ -x "${OSINT_SCRIPT}" ] && "${OSINT_SCRIPT}" & || echo "OSINT script missing or not executable"; }
 run_wifi(){
-  if [ -f "${WIFI_TOOL_PY}" ]; then
-    if command -v python3 >/dev/null 2>&1; then
-      python3 "${WIFI_TOOL_PY}" &
-      return 0
-    elif command -v python >/dev/null 2>&1; then
-      python "${WIFI_TOOL_PY}" &
-      return 0
-    else
-      echo "Python not installed"
-      return 1
-    fi
-  else
-    echo "WiFi tool not found: ${WIFI_TOOL_PY}"
-    return 1
-  fi
+  [ -f "${WIFI_TOOL_PY}" ] || { echo "WiFi tool not found"; return 1; }
+  (command -v python3 >/dev/null && python3 "${WIFI_TOOL_PY}" & ) || (command -v python && python "${WIFI_TOOL_PY}" & )
 }
 
-# ---------- TUI DRAWING ----------
-# Minimal box drawing using tput; updates every REFRESH_INTERVAL seconds
-draw_header(){
-  tput cup 0 0
-  printf "%b" "${BOLD}${BLUE}Termux Live Status Dashboard${RESET}"
-  tput cup 0 $(( COLUMNS - 30 ))
-  printf "%b" "${YELLOW}Refresh: ${REFRESH_INTERVAL}s${RESET}"
-  tput cup 1 0
-  printf "%b" "Press ${BOLD}G${RESET}=GitHub  ${BOLD}V${RESET}=Vercel  ${BOLD}R${RESET}=Render  ${BOLD}D${RESET}=Device  ${BOLD}P${RESET}=Ports  ${BOLD}O${RESET}=Run OSINT  ${BOLD}W${RESET}=Run WiFi  ${BOLD}Q${RESET}=Quit"
-}
-
-draw_section_box(){
-  # draw a rectangle starting at row,col with width,height and title
-  local r="$1" c="$2" w="$3" h="$4" title="$5"
-  tput cup "$r" "$c"
-  printf "+"
-  for ((i=1;i<w-1;i++)); do printf "-"; done
-  printf "+"
-  for ((row=r+1; row<r+h-1; row++)); do
-    tput cup "$row" "$c"
-    printf "|"
-    tput cup "$row" $((c+w-1))
-    printf "|"
-  done
-  tput cup $((r+h-1)) "$c"
-  printf "+"
-  for ((i=1;i<w-1;i++)); do printf "-"; done
-  printf "+"
-  # title
-  tput cup "$r" $((c+2))
-  printf "%b" "${BOLD}${title}${RESET}"
-}
-
-# Render content with safe truncation by width/height
-render_lines_into_box(){
-  local start_row="$1"; local start_col="$2"; local box_w="$3"; local box_h="$4"; shift
-  local -a lines=( "$@" )
-  local max_lines=$((box_h-2))
-  local i=0
-  for line in "${lines[@]}"; do
-    if [ "$i" -ge "$max_lines" ]; then break; fi
-    # truncate to width-2
-    local out=$(printf "%s" "$line" | cut -c1-$((box_w-2)))
-    tput cup $((start_row+1+i)) $((start_col+1))
-    printf "%b" "${out}"
-    i=$((i+1))
-  done
-  # clear any remaining lines inside box
-  while [ "$i" -lt "$max_lines" ]; do
-    tput cup $((start_row+1+i)) $((start_col+1))
-    printf "%b" " %${box_w:-1}s" " "
-    i=$((i+1))
-  done
-}
-
-# ---------- SNAPSHOT LOGGING ----------
+# ---------- LOGGING ----------
 log_snapshot(){
-  local stamp
-  stamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local stamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   local outfile="$LOG_DIR/$(date +%F).log"
   {
     printf "==== Snapshot %s ====\n" "$stamp"
-    printf "-- Device --\n"
-    device_summary
-    printf "\n-- GitHub --\n"
-    github_fetch | sed -n '1,20p'
-    printf "\n-- Vercel --\n"
-    vercel_fetch | sed -n '1,20p'
-    printf "\n-- Render --\n"
-    render_fetch | sed -n '1,20p'
-    printf "\n-- Listening --\n"
-    listening_sockets | sed -n '1,200p'
+    printf "-- Device --\n"; device_summary
+    printf "\n-- GitHub --\n"; github_fetch | sed -n '1,20p'
+    printf "\n-- Vercel --\n"; vercel_fetch | sed -n '1,20p'
+    printf "\n-- Render --\n"; render_fetch | sed -n '1,20p'
+    printf "\n-- Listening --\n"; listening_sockets | sed -n '1,20p'
     printf "\n\n"
   } >>"$outfile"
-  # keep permissions tight
   chmod 600 "$outfile" || true
 }
 
-# ---------- MAIN LOOP / KEY HANDLING ----------
-main_loop(){
-  # initial drawing
-  clear
-  trap 'cleanup; exit 0' INT TERM
-  while true; do
-    COLUMNS=$(tput cols)
-    LINES=$(tput lines)
-    clear
-    draw_header
+# ---------- TUI ----------
+draw_header(){
+  tput cup 0 0
+  printf "%b" "${BOLD}${BLUE}Termux Live Dashboard${RESET}"
+  tput cup 0 $(( COLUMNS - 30 ))
+  printf "%b" "${YELLOW}Refresh: ${REFRESH_INTERVAL}s${RESET}"
+  tput cup 1 0
+  printf "%b" "Press ${BOLD}G${RESET}=GitHub  ${BOLD}V${RESET}=Vercel  ${BOLD}R${RESET}=Render  ${BOLD}D${RESET}=Device  ${BOLD}P${RESET}=Ports  ${BOLD}O${RESET}=OSINT  ${BOLD}W${RESET}=WiFi  ${BOLD}N${RESET}=nmap  ${BOLD}L${RESET}=Log  ${BOLD}Q${RESET}=Quit"
+}
 
-    # compute layout: top box (left: github/vercel), right: render/device, bottom: ports
-    local left_w=$(( COLUMNS/2 - 2 ))
-    local right_w=$(( COLUMNS - left_w - 4 ))
-    local top_h=$(( (LINES-6)/2 ))
-    local bottom_h=$(( LINES - top_h - 6 ))
+draw_box(){
+  local r="$1" c="$2" w="$3" h="$4" title="$5"
+  tput cup "$r" "$c"; printf "+"; for ((i=1;i<w-1;i++)); do printf "-"; done; printf "+"
+  for ((row=r+1;row<r+h-1;row++)); do tput cup $row "$c"; printf "|"; tput cup $row $((c+w-1)); printf "|"; done
+  tput cup $((r+h-1)) "$c"; printf "+"; for ((i=1;i<w-1;i++)); do printf "-"; done; printf "+"
+  tput cup "$r" $((c+2)); printf "%b" "${BOLD}${title}${RESET}"
+}
 
-    # boxes
-    draw_section_box 3 0 $left_w $top_h " GitHub (recent repos & actions) "
-    draw_section_box 3 $((left_w+2)) $right_w $top_h " Vercel (projects) / Render (services) "
-    draw_section_box $((3+top_h+1)) 0 $((COLUMNS)) $((bottom_h+3)) " Device & Ports (press P for details) "
-
-    # fetch data (non-blocking where possible)
-    # GitHub
-    mapfile -t gh_lines < <(github_fetch 2>/dev/null || echo "Unable to fetch GitHub (token missing/timeout)")
-    # For each repo add action status
-    local gh_display=()
-    for rline in "${gh_lines[@]}"; do
-      # extract full repo name from line start: "<full_name> • ..."
-      repo_name=$(printf "%s" "$rline" | awk -F' • ' '{print $1}')
-      act=$(github_actions_status "$repo_name" 2>/dev/null || echo "—")
-      gh_display+=("$rline")
-      gh_display+=("   ↳ $act")
-    done
-
-    # Vercel
-    mapfile -t ver_lines < <(vercel_fetch 2>/dev/null || echo "Unable to fetch Vercel (token missing/timeout)")
-
-    # Render
-    mapfile -t render_lines < <(render_fetch 2>/dev/null || echo "Unable to fetch Render (token missing/timeout)")
-
-    # Device summary
-    mapfile -t dev_lines < <(device_summary | sed -n '1,20p')
-
-    # Ports (show top few listening lines)
-    mapfile -t ports_lines < <(listening_sockets | sed -n '1,20p')
-
-    # render into boxes
-    render_lines_into_box 3 0 $left_w $top_h "${gh_display[@]:0:40}"
-    render_lines_into_box 3 $((left_w+2)) $right_w $top_h "${ver_lines[@]:0:20}" "${render_lines[@]:0:20}"
-
-    # build bottom content - combine device & ports
-    bottom_content=()
-    bottom_content+=("Device summary:")
-    for ln in "${dev_lines[@]}"; do bottom_content+=("  $ln"); done
-    bottom_content+=("")
-    bottom_content+=("Listening sockets (top):")
-    for ln in "${ports_lines[@]:0:10}"; do bottom_content+=("  $ln"); done
-    bottom_content+=("")
-    bottom_content+=("Shortcuts: [O] OSINT  [W] WiFi  [N] nmap quick  [L] Log snapshot  [Q] Quit")
-    render_lines_into_box $((3+top_h+1)) 0 $((COLUMNS)) $((bottom_h+3)) "${bottom_content[@]}"
-
-    # log snapshot (rotate by minute interval) - async to avoid blocking
-    log_snapshot &>/dev/null &
-
-    # wait for keypress with timeout = REFRESH_INTERVAL
-    # read -t handles fractional seconds if supported
-    read -rsn1 -t "$REFRESH_INTERVAL" key 2>/dev/null || key=""
-    case "$key" in
-      G|g)
-        # open GitHub quick view - render a detailed text view below (blocking)
-        clear
-        echo "=== GitHub Detailed ==="
-        github_fetch | sed -n '1,200p'
-        echo
-        echo "Enter repo full name to view latest workflow status (or ENTER to return):"
-        read -r repo_choice
-        if [ -n "$repo_choice" ]; then
-          echo "Latest workflow for $repo_choice:"
-          github_actions_status "$repo_choice" | sed -n '1,200p'
-        fi
-        echo "Press ENTER to continue..."
-        read -r _
-        ;;
-      V|v)
-        clear
-        echo "=== Vercel Projects ==="
-        vercel_fetch | sed -n '1,200p'
-        echo
-        echo "To check last deployment for a projectId, enter projectId (or ENTER to return):"
-        read -r pid
-        if [ -n "$pid" ]; then
-          vercel_last_deploy "$pid" | sed -n '1,200p'
-        fi
-        echo "Press ENTER to continue..."
-        read -r _
-        ;;
-      R|r)
-        clear
-        echo "=== Render Services ==="
-        render_fetch | sed -n '1,200p'
-        echo "Press ENTER to continue..."
-        read -r _
-        ;;
-      D|d)
-        clear
-        echo "=== Device Summary ==="
-        device_summary | sed -n '1,200p'
-        echo
-        echo "Press ENTER to continue..."
-        read -r _
-        ;;
-      P|p)
-        clear
-        echo "=== Listening Sockets ==="
-        listening_sockets | sed -n '1,400p'
-        echo
-        echo "Options: [n] Run quick nmap on local IP (requires nmap), [ENTER] return"
-        read -rsn1 -t 10 nmkey 2>/dev/null || nmkey=""
-        if [[ "$nmkey" =~ ^[nN]$ ]]; then
-          echo "Running quick nmap..."
-          nmap_scan_local | sed -n '1,400p'
-          echo
-          echo "Press ENTER to continue..."
-          read -r _
-        else
-          echo "Returning..."
-          sleep 1
-        fi
-        ;;
-      O|o)
-        clear
-        echo "Launching OSINT script in background..."
-        run_osint && echo "OSINT started." || echo "Failed to start OSINT."
-        sleep 1
-        ;;
-      W|w)
-        clear
-        echo "Launching WiFi tool in background..."
-        run_wifi && echo "WiFi tool started." || echo "Failed to start WiFi tool."
-        sleep 1
-        ;;
-      N|n)
-        clear
-        echo "nmap quick scan (local)..."
-        nmap_scan_local | sed -n '1,400p'
-        echo "Press ENTER to continue..."
-        read -r _
-        ;;
-      L|l)
-        echo "Forcing snapshot log..."
-        log_snapshot && echo "Logged to $LOG_DIR/$(date +%F).log"
-        sleep 1
-        ;;
-      Q|q)
-        cleanup
-        exit 0
-        ;;
-      *)
-        # no key / timed out => refresh loop again
-        ;;
-    esac
+render_lines_box(){
+  local r="$1" c="$2" w="$3" h="$4"; shift; local lines=( "$@" ); local max=$((h-2))
+  for i in $(seq 0 $((max-1))); do
+    tput cup $((r+1+i)) $((c+1))
+    [ $i -lt ${#lines[@]} ] && printf "%-${w}s" "${lines[$i]:0:$((w-2))}" || printf "%-${w}s" " "
   done
 }
 
-cleanup(){
+# ---------- MAIN LOOP ----------
+main_loop(){
+  trap 'tput cnorm; clear; exit' INT TERM EXIT
+  tput civis
+  while true; do
+    clear
+    COLUMNS=$(tput cols || echo 80)
+    LINES=$(tput lines || echo 24)
+    left_w=$((COLUMNS/2-2)); [ "$left_w" -lt 20 ] && left_w=20
+    right_w=$((COLUMNS-left_w-4)); [ "$right_w" -lt 20 ] && right_w=20
+    top_h=$(( (LINES-6)/2 )); [ "$top_h" -lt 5 ] && top_h=5
+    bottom_h=$((LINES-top_h-6)); [ "$bottom_h" -lt 5 ] && bottom_h=5
+
+    draw_header
+    draw_box 3 0 $left_w $top_h "GitHub"
+    draw_box 3 $((left_w+2)) $right_w $top_h "Vercel / Render"
+    draw_box $((3+top_h+1)) 0 $COLUMNS $((bottom_h+3)) "Device & Ports"
+
+    mapfile -t gh_lines < <(github_fetch 2>/dev/null || echo "No GitHub data")
+    mapfile -t ver_lines < <(vercel_fetch 2>/dev/null || echo "No Vercel data")
+    mapfile -t render_lines < <(render_fetch 2>/dev/null || echo "No Render data")
+    mapfile -t dev_lines < <(device_summary)
+    mapfile -t ports_lines < <(listening_sockets | head -n20)
+
+    render_lines_box 3 0 $left_w $top_h "${gh_lines[@]}"
+    render_lines_box 3 $((left_w+2)) $right_w $top_h "${ver_lines[@]}" "${render_lines[@]}"
+    bottom_content=()
+    bottom_content+=("Device summary:")
+    bottom_content+=("${dev_lines[@]}")
+    bottom_content+=("")
+    bottom_content+=("Listening sockets:")
+    bottom_content+=("${ports_lines[@]}")
+    bottom_content+=("")
+    bottom_content+=("Shortcuts: [O] OSINT  [W] WiFi  [N] nmap  [L] Log snapshot  [Q] Quit")
+    render_lines_box $((3+top_h+1)) 0 $COLUMNS $((bottom_h+3)) "${bottom_content[@]}"
+
+    log_snapshot &>/dev/null &
+
+    read -rsn1 -t "$REFRESH_INTERVAL" key 2>/dev/null || key=""
+    case "$key" in
+      G|g) clear; github_fetch; echo "Press ENTER"; read -r _;;
+      V|v) clear; vercel_fetch; echo "Press ENTER"; read -r _;;
+      R|r) clear; render_fetch; echo "Press ENTER"; read -r _;;
+      D|d) clear; device_summary; echo "Press ENTER"; read -r _;;
+      P|p) clear; listening_sockets; echo "Press ENTER"; read -r _;;
+      O|o) run_osint;;
+      W|w) run_wifi;;
+      N|n) nmap_scan_local;;
+      L|l) log_snapshot;;
+      Q|q) break;;
+    esac
+  done
   tput cnorm
   clear
-  echo "Exiting dashboard..."
 }
 
-# ---------- STARTUP ----------
+# ---------- START ----------
 load_env
 check_deps
-tput civis    # hide cursor
 main_loop
